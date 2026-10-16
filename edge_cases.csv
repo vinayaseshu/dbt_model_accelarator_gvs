@@ -1,5 +1,0 @@
-SOURCE_TABLE,SOURCE_COLUMN,TARGET_TABLE,TARGET_COLUMN,TARGET_DATATYPE,MODEL_NAME,MATERIALIZATION,UNIQUE_KEY,JOIN_CONDITION,JOIN_TYPE,INCREMENTAL_FILTER
-EMP,EMPNO,EMP_FULL,EMPNO,int,emp_full.sql,incremental,empno,emp.deptno=dept.deptno;dept.locid=loc.locid,left,emp.empno > (select max(empno) from {{ this }})
-EMP,ENAME,EMP_FULL,employee_name,,emp_full.sql,,,,,
-DEPT,DNAME,EMP_FULL,lower(dname),varchar(50),emp_full.sql,,,,,
-LOC,CITY,EMP_FULL,CITY,,emp_full.sql,,,,,
