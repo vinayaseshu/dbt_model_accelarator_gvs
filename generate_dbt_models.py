@@ -4,11 +4,15 @@ dbt Model Accelerator  (v2 - best-practice edition)
 ===================================================
 Generates a dbt project slice from a Source-to-Target Mapping (STM) spreadsheet:
 
-  models/staging/<source>/_<source>__sources.yml        source definitions (+ optional freshness)
-  models/staging/<source>/stg_<source>__<table>.sql     OPTIONAL staging layer, one per source table
-  models/staging/<source>/_<source>__models.yml         OPTIONAL staging docs
-  models/<folder>/<model>.sql                           one per MODEL_NAME (default folder: marts)
-  models/<folder>/_<folder>__models.yml                 docs, data_type, tests, contracts
+  models/<staging folder>/_<source>__sources.yml        source definitions (+ optional freshness)
+  models/<staging folder>/stg_<source>__<table>.sql     OPTIONAL staging layer, one per source table
+  models/<staging folder>/_<folder>__models.yml         OPTIONAL staging docs
+  models/<target folder>/<model>.sql                    one per MODEL_NAME
+  models/<target folder>/_<folder>__models.yml          docs, data_type, tests, contracts
+
+Folders (relative to the models/ root; nested paths allowed):
+  STAGING_MODEL_FOLDER  per source table; blank = <--staging-dir>/<source>   (default staging/<source>)
+  TARGET_MODEL_FOLDER   per model;        blank = <--marts-dir>              (default marts)
   packages.yml, dbt_project_snippet.yml, .sqlfluff      project scaffolding
   generation_report.md                                  validation + lineage report
 
@@ -16,7 +20,8 @@ Mapping columns (case-insensitive; "SORUCE_TABLE" typo accepted)
   Required : SOURCE_TABLE, SOURCE_COLUMN, TARGET_COLUMN, MODEL_NAME
   Core     : TARGET_TABLE, TARGET_DATATYPE, MATERIALIZATION, UNIQUE_KEY, JOIN_CONDITION
   Optional : JOIN_TYPE, INCREMENTAL_FILTER, SOURCE_NAME, MODEL_FOLDER, SCHEMA, TAGS,
-             MODEL_DESCRIPTION, COLUMN_DESCRIPTION, COLUMN_TESTS, USE_STAGING
+             MODEL_DESCRIPTION, COLUMN_DESCRIPTION, COLUMN_TESTS, USE_STAGING,
+             STAGING_MODEL_FOLDER, TARGET_MODEL_FOLDER (alias MODEL_FOLDER)
 
 Staging layer is OPTIONAL and off by default:
   --staging            build stg_ models for every target model
@@ -42,7 +47,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 log = logging.getLogger("dbt_accelerator")
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +60,8 @@ HEADER_ALIASES = {
     "DATATYPE": "TARGET_DATATYPE", "MATERIALISATION": "MATERIALIZATION", "TESTS": "COLUMN_TESTS",
     "TARGET_SCHEMA": "SCHEMA", "SOURCE_SYSTEM": "SOURCE_NAME", "FOLDER": "MODEL_FOLDER",
     "STAGING": "USE_STAGING", "STAGING_LAYER": "USE_STAGING",
+    "TARGET_MODEL_FOLDER": "MODEL_FOLDER", "TARGET_FOLDER": "MODEL_FOLDER",
+    "STAGING_MODEL_FOLDER": "STAGING_FOLDER", "STG_FOLDER": "STAGING_FOLDER", "STAGING_DIR": "STAGING_FOLDER",
 }
 REQUIRED = ["SOURCE_TABLE", "SOURCE_COLUMN", "TARGET_COLUMN", "MODEL_NAME"]
 MODEL_LEVEL = ["MATERIALIZATION", "UNIQUE_KEY", "JOIN_CONDITION", "JOIN_TYPE", "INCREMENTAL_FILTER",
@@ -95,6 +102,24 @@ def split_list(text: str) -> list[str]:
     return [x for x in out if x]
 
 
+def normalize_folder(text: str) -> tuple[str, str | None]:
+    """Clean a folder path relative to models/. Returns (path, error)."""
+    raw = (text or "").strip().replace("\\", "/")
+    if not raw:
+        return "", None
+    parts = [p for p in raw.strip("/").split("/") if p and p != "."]
+    if parts and parts[0].lower() == "models":  # tolerate 'models/marts/hr'
+        parts = parts[1:]
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or ".." in parts:
+        return "", f"folder '{text}' must be a relative path under models/ (no absolute paths or '..')"
+    bad = [p for p in parts if not re.match(r"^[A-Za-z0-9_\-]+$", p)]
+    if bad:
+        return "", f"folder '{text}' has invalid segment(s) {bad}; use letters, digits, _ or -"
+    if not parts:
+        return "", f"folder '{text}' resolves to the models/ root; give a sub-folder"
+    return "/".join(p.lower() for p in parts), None
+
+
 # --------------------------------------------------------------------------- #
 # Options
 # --------------------------------------------------------------------------- #
@@ -103,7 +128,8 @@ class Options:
     source_name: str = "raw"
     source_schema: str | None = None
     staging: bool = False  # default for models whose USE_STAGING is blank
-    default_folder: str = "marts"
+    default_folder: str = "marts"   # target models when TARGET_MODEL_FOLDER is blank
+    staging_dir: str = "staging"    # staging root when STAGING_MODEL_FOLDER is blank (-> staging/<source>)
     enforce_contracts: bool = False
     surrogate_key: bool = False
     audit_columns: bool = False
@@ -133,6 +159,7 @@ class ColumnMap:
     target_datatype: str
     description: str = ""
     tests: str = ""
+    staging_folder: str = ""
 
     @property
     def alias(self) -> str:  # SQL alias / CTE name for the source table
@@ -183,7 +210,8 @@ class Model:
 
     @property
     def folder(self) -> str:
-        return self.first("MODEL_FOLDER", "").strip("/ ").lower()
+        """Explicit TARGET_MODEL_FOLDER (normalized) or '' if not provided."""
+        return normalize_folder(self.first("MODEL_FOLDER", ""))[0]
 
     @property
     def tags(self) -> list[str]:
@@ -253,6 +281,7 @@ def build_models(rows: list[dict], opts: Options) -> "OrderedDict[str, Model]":
             target_datatype=r.get("TARGET_DATATYPE", ""),
             description=r.get("COLUMN_DESCRIPTION", ""),
             tests=r.get("COLUMN_TESTS", ""),
+            staging_folder=r.get("STAGING_FOLDER", ""),
         ))
         for key in MODEL_LEVEL:
             v = r.get(key, "")
@@ -360,6 +389,16 @@ def validate(m: Model, opts: Options) -> None:
         if len(m.attrs[key]) > 1:
             m.errors.append(f"Conflicting {key} values: {m.attrs[key]}")
 
+    if m.attrs["MODEL_FOLDER"]:
+        _, err = normalize_folder(m.first("MODEL_FOLDER"))
+        if err:
+            m.errors.append(f"TARGET_MODEL_FOLDER: {err}")
+    for c in m.columns:
+        if c.staging_folder:
+            _, err = normalize_folder(c.staging_folder)
+            if err:
+                m.errors.append(f"Row {c.row} STAGING_MODEL_FOLDER: {err}")
+
     if not SNAKE_RE.match(m.name):
         m.warnings.append(f"Model name '{m.name}' is not snake_case")
     if len(m.target_tables) > 1:
@@ -434,9 +473,10 @@ def staging_name(source: str, table: str) -> str:
     return f"stg_{source}__{table}"
 
 
-def render_staging(source: str, table: str, columns: list[str], opts: Options) -> str:
+def render_staging(source: str, table: str, columns: list[str], opts: Options, explicit_view: bool = False) -> str:
     cols = ",\n        ".join(columns)
-    return (
+    cfg = "{{ config(materialized='view') }}\n\n" if explicit_view else ""
+    return cfg + (
         f"-- Staging model for {source}.{table}. Auto-generated by dbt_accelerator v{__version__} "
         f"from {opts.mapping_file}.\n"
         "-- One staging model per source table: light renaming only, no joins or business logic.\n\n"
@@ -597,10 +637,10 @@ def render_sources_yml(source: str, tables: "OrderedDict[str, OrderedDict[str, N
     return yaml_doc({"version": 2, "sources": [src]})
 
 
-def render_staging_yml(source: str, tables: "OrderedDict[str, OrderedDict[str, None]]") -> str:
-    models = [{"name": staging_name(source, t),
-               "description": f"Staging model for {source}.{t} (1:1 with source, renamed only).",
-               "columns": [{"name": c} for c in cols]} for t, cols in tables.items()]
+def render_staging_yml(entries: list[tuple[str, str, list[str]]]) -> str:
+    models = [{"name": staging_name(s, t),
+               "description": f"Staging model for {s}.{t} (1:1 with source, renamed only).",
+               "columns": [{"name": c} for c in cols]} for s, t, cols in entries]
     return yaml_doc({"version": 2, "models": models})
 
 
@@ -657,15 +697,32 @@ def render_packages(needs_utils: bool) -> str | None:
     return yaml_doc({"packages": [{"package": "dbt-labs/dbt_utils", "version": [">=1.1.0", "<2.0.0"]}]})
 
 
-def render_project_snippet(folders: list[str], opts: Options, has_staging: bool) -> str:
+def render_project_snippet(target_folders: list[str], staging_folders: list[str], opts: Options) -> str:
     tree: dict = {}
-    if has_staging:
-        tree["staging"] = {"+materialized": "view", "+tags": ["staging"]}
-    for f in folders:
+
+    def node_for(path: str) -> dict:
         node = tree
-        for part in f.split("/"):
+        for part in path.split("/"):
             node = node.setdefault(part, {})
-        node.setdefault("+materialized", "table")
+        return node
+
+    # Staging defaults go on the staging root when every staging folder sits under it,
+    # otherwise on each staging folder. Target folders get table.
+    roots = {f.split("/")[0] for f in staging_folders}
+    stg_nodes = [opts.staging_dir] if staging_folders and roots == {opts.staging_dir} else staging_folders
+    def covered(f: str, folders: list[str]) -> bool:  # an ancestor already sets the default
+        return any(f.startswith(a + "/") for a in folders if a != f)
+
+    stg_nodes = [f for f in stg_nodes if f not in target_folders]  # shared folders use explicit config()
+    for f in sorted(stg_nodes, key=lambda x: x.count("/")):
+        if not covered(f, stg_nodes):
+            n = node_for(f)
+            n["+materialized"] = "view"
+            n["+tags"] = ["staging"]
+    for f in sorted(target_folders, key=lambda x: x.count("/")):
+        if not covered(f, target_folders):
+            n = node_for(f)
+            n.update({"+materialized": "table", **{k: v for k, v in n.items() if k != "+materialized"}})
     head = "# Merge into dbt_project.yml - folder-level defaults (model-level config() still wins).\n"
     return head + yaml_doc({"models": {opts.project_name: tree}})
 
@@ -715,6 +772,30 @@ def generate(models: "OrderedDict[str, Model]", out: Path, opts: Options, force:
         (skipped if m.errors and not force else written).append(m)
 
     mdir = out / "models"
+    # Folder resolution ---------------------------------------------------------
+    def target_folder(m: Model) -> str:
+        return m.folder or opts.default_folder
+
+    stg_folder_of: dict[tuple[str, str], str] = {}
+    folder_rows: dict[tuple[str, str], dict[str, list[int]]] = OrderedDict()
+    for m in written:
+        for c in m.columns:
+            f = normalize_folder(c.staging_folder)[0]
+            if f:
+                folder_rows.setdefault((c.source_name, c.alias), OrderedDict()).setdefault(f, []).append(c.row)
+    global_warnings: list[str] = []
+    for key, choices in folder_rows.items():
+        stg_folder_of[key] = next(iter(choices))
+        if len(choices) > 1:
+            global_warnings.append(f"Source table {key[0]}.{key[1]} has conflicting STAGING_MODEL_FOLDER values "
+                                   f"{dict(choices)} (rows); using '{stg_folder_of[key]}'")
+
+    def staging_folder(s: str, t: str) -> str:
+        return stg_folder_of.get((s, t)) or f"{opts.staging_dir}/{s}"
+
+    for w in global_warnings:
+        log.warning("%s", w)
+
     # Staging layer + sources ------------------------------------------------
     # by_source: every source table any model reads (-> sources.yml)
     # by_stage : only tables read by models that use the staging layer (-> stg_ models)
@@ -725,21 +806,35 @@ def generate(models: "OrderedDict[str, Model]", out: Path, opts: Options, force:
             by_source.setdefault(s, OrderedDict()).setdefault(t, OrderedDict()).update(cols)
             if m.use_staging:
                 by_stage.setdefault(s, OrderedDict()).setdefault(t, OrderedDict()).update(cols)
+
+    # sources.yml: in the source's staging folder when all its tables share one, else the default
     for s, tables in by_source.items():
-        sdir = mdir / "staging" / s
+        folders = {staging_folder(s, t) for t in tables}
+        sdir = mdir / (folders.pop() if len(folders) == 1 else f"{opts.staging_dir}/{s}")
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / f"_{s}__sources.yml").write_text(render_sources_yml(s, tables, opts), encoding="utf-8")
+
+    target_folders = list(OrderedDict.fromkeys(target_folder(m) for m in written))
+    stage_groups: "OrderedDict[str, list[tuple[str, str, list[str]]]]" = OrderedDict()
     for s, tables in by_stage.items():
-        sdir = mdir / "staging" / s
-        (sdir / f"_{s}__models.yml").write_text(render_staging_yml(s, tables), encoding="utf-8")
         for t, cols in tables.items():
-            (sdir / f"{staging_name(s, t)}.sql").write_text(render_staging(s, t, list(cols), opts), encoding="utf-8")
-            log.info("Wrote staging/%s/%s.sql", s, staging_name(s, t))
+            stage_groups.setdefault(staging_folder(s, t), []).append((s, t, list(cols)))
+    for folder, entries in stage_groups.items():
+        sdir = mdir / folder
+        sdir.mkdir(parents=True, exist_ok=True)
+        shared = folder in target_folders
+        leaf = folder.split("/")[-1]
+        yml = f"_{leaf}__staging_models.yml" if shared else f"_{leaf}__models.yml"
+        (sdir / yml).write_text(render_staging_yml(entries), encoding="utf-8")
+        for s, t, cols in entries:
+            (sdir / f"{staging_name(s, t)}.sql").write_text(
+                render_staging(s, t, cols, opts, explicit_view=shared), encoding="utf-8")
+            log.info("Wrote %s/%s.sql", folder, staging_name(s, t))
 
     # Target models -----------------------------------------------------------
     by_folder: "OrderedDict[str, list[Model]]" = OrderedDict()
     for m in written:
-        by_folder.setdefault(m.folder or opts.default_folder, []).append(m)
+        by_folder.setdefault(target_folder(m), []).append(m)
     for folder, ms in by_folder.items():
         fdir = mdir / folder
         fdir.mkdir(parents=True, exist_ok=True)
@@ -755,33 +850,40 @@ def generate(models: "OrderedDict[str, Model]", out: Path, opts: Options, force:
     pk = render_packages(needs_utils)
     if pk:
         (out / "packages.yml").write_text(pk, encoding="utf-8")
-    (out / "dbt_project_snippet.yml").write_text(render_project_snippet(list(by_folder), opts, bool(by_stage)), encoding="utf-8")
+    (out / "dbt_project_snippet.yml").write_text(render_project_snippet(target_folders, list(stage_groups), opts), encoding="utf-8")
     (out / ".sqlfluff").write_text(render_sqlfluff(opts), encoding="utf-8")
-    write_report(models, written, skipped, by_source, by_stage, out, opts)
+    write_report(models, written, skipped, by_source, by_stage, staging_folder, global_warnings, out, opts)
     return written, skipped
 
 
-def write_report(models, written, skipped, by_source, by_stage, out: Path, opts: Options) -> None:
+def write_report(models, written, skipped, by_source, by_stage, staging_folder, global_warnings,
+                 out: Path, opts: Options) -> None:
     feats = [("Staging default", opts.staging), ("Model contracts", opts.enforce_contracts),
              ("Surrogate keys", opts.surrogate_key), ("Audit columns", opts.audit_columns),
              ("Source freshness", bool(opts.freshness_field))]
     rep = [f"# dbt accelerator v{__version__} - generation report", "",
            f"Mapping: `{opts.mapping_file}`  ", "Features: " + ", ".join(f"{n}={'on' if v else 'off'}" for n, v in feats),
            "", "## Models", "",
-           "| Model | Status | Folder | Materialization | Unique key | Staging | Contract | Upstream | Issues |",
+           "| Model | Status | Target folder | Materialization | Unique key | Staging | Contract | Upstream | Issues |",
            "|---|---|---|---|---|---|---|---|---|"]
     for m in models.values():
         status = "SKIPPED" if m in skipped else ("WRITTEN (with errors)" if m.errors else "OK")
         ups = ", ".join(staging_name(s, t) if m.use_staging else f"source {s}.{t}" for s, t in m.sources)
         issues = "<br>".join([f"ERROR: {e}" for e in m.errors] + [f"WARN: {w}" for w in m.warnings]) or "-"
-        rep.append(f"| {m.name} | {status} | {m.folder or opts.default_folder} | {m.materialization} | "
+        folder = f"models/{m.folder}" if m.folder else f"models/{opts.default_folder} (default)"
+        rep.append(f"| {m.name} | {status} | {folder} | {m.materialization} | "
                    f"{', '.join(m.effective_unique_key) or '-'} | {'yes' if m.use_staging else 'no'} | "
                    f"{'yes' if m.contract else 'no'} | {ups} | {issues} |")
-    rep += ["", "## Sources", "", "| Source | Table | Staging model | Columns used |", "|---|---|---|---|"]
+    rep += ["", "## Sources", "", "| Source | Table | Staging model | Staging folder | Columns used |",
+            "|---|---|---|---|---|"]
     for s, tables in by_source.items():
         for t, cols in tables.items():
-            stg = staging_name(s, t) if t in by_stage.get(s, {}) else "-"
-            rep.append(f"| {s} | {t} | {stg} | {', '.join(cols)} |")
+            staged = t in by_stage.get(s, {})
+            stg = staging_name(s, t) if staged else "-"
+            fold = f"models/{staging_folder(s, t)}" if staged else "-"
+            rep.append(f"| {s} | {t} | {stg} | {fold} | {', '.join(cols)} |")
+    if global_warnings:
+        rep += ["", "## Warnings", ""] + [f"- {w}" for w in global_warnings]
     (out / "generation_report.md").write_text("\n".join(rep) + "\n", encoding="utf-8")
 
 
@@ -825,7 +927,11 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--staging", action=argparse.BooleanOptionalAction, default=False,
                    help="Build a stg_<source>__<table> layer and ref() it (default: off - models select from "
                         "source() directly). The USE_STAGING column (Y/N) overrides this per model.")
-    g.add_argument("--marts-dir", default="marts", help="Default folder for target models (MODEL_FOLDER overrides)")
+    g.add_argument("--marts-dir", default="marts",
+                   help="Default target-model folder under models/ (TARGET_MODEL_FOLDER overrides per model)")
+    g.add_argument("--staging-dir", default="staging",
+                   help="Default staging root under models/; models go to <staging-dir>/<source> "
+                        "(STAGING_MODEL_FOLDER overrides per source table)")
     g.add_argument("--enforce-contracts", action="store_true", help="Add enforced model contracts (needs datatypes)")
     g.add_argument("--surrogate-key", action="store_true",
                    help="Composite keys -> dbt_utils.generate_surrogate_key column used as unique_key")
@@ -845,8 +951,16 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(levelname)-7s %(message)s")
+
+    def cli_folder(value: str, flag: str) -> str:
+        path, err = normalize_folder(value)
+        if err:
+            ap.error(f"{flag}: {err}")
+        return path
+
     opts = Options(source_name=a.source_name.lower(), source_schema=a.source_schema, staging=a.staging,
-                   default_folder=a.marts_dir.strip("/ ").lower(), enforce_contracts=a.enforce_contracts,
+                   default_folder=cli_folder(a.marts_dir, "--marts-dir"),
+                   staging_dir=cli_folder(a.staging_dir, "--staging-dir"), enforce_contracts=a.enforce_contracts,
                    surrogate_key=a.surrogate_key, audit_columns=a.audit_columns,
                    composite_test=not a.no_composite_test, legacy_test_syntax=a.legacy_test_syntax,
                    freshness_field=a.freshness_field, project_name=a.project_name, dialect=a.dialect,
