@@ -6,10 +6,10 @@ optional contracts, and CI drift checks.
 
 ## Quick start
     pip install openpyxl
-    python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output              # no staging layer
-    python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output --staging    # with staging layer
+    python generate_dbt_models.py source_to_target__dbt_mapping_template.xlsx -o dbt_output              # no staging layer
+    python generate_dbt_models.py source_to_target__dbt_mapping_template.xlsx -o dbt_output --staging    # with staging layer
     # strict "production" profile
-    python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output \
+    python generate_dbt_models.py source_to_target__dbt_mapping_template.xlsx -o dbt_output \
         --enforce-contracts --surrogate-key --audit-columns --freshness-field _loaded_at
 
 Copy `dbt_output/models/*` into your project, merge `dbt_project_snippet.yml` into `dbt_project.yml`,
