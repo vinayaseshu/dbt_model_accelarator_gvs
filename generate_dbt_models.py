@@ -47,7 +47,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 log = logging.getLogger("dbt_accelerator")
 
 # --------------------------------------------------------------------------- #
@@ -297,16 +297,30 @@ def is_expression(text: str) -> bool:
     return not IDENT_RE.match(text.strip().strip('"'))
 
 
+_ALIAS_RE = re.compile(r"^(?P<expr>.+?)\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*$", re.I | re.S)
+
+
+def split_alias(text: str) -> tuple[str, str | None]:
+    """'<expr> as <name>' -> (expr, name). Only a top-level trailing alias counts, so
+    'cast(x as int)' stays an un-aliased expression."""
+    m = _ALIAS_RE.match(text.strip())
+    if m:
+        expr = m.group("expr")
+        if expr.count("(") == expr.count(")") and expr.count("'") % 2 == 0 and is_expression(expr):
+            return expr.strip(), m.group("alias").lower()
+    return text.strip(), None
+
+
 def target_alias(c: ColumnMap) -> str:
     if is_expression(c.target_column):
-        return c.source_column.lower()
+        return split_alias(c.target_column)[1] or c.source_column.lower()
     return c.target_column.strip().strip('"').lower()
 
 
 def source_expression(c: ColumnMap, qualify: bool) -> str:
     col = c.source_column.lower()
     if is_expression(c.target_column):
-        expr = c.target_column.strip()
+        expr = split_alias(c.target_column)[0]
         if qualify:
             expr = re.sub(rf"(?<![\w.]){re.escape(c.source_column)}(?![\w(])", f"{c.alias}.{col}", expr, flags=re.I)
         return expr
@@ -330,7 +344,7 @@ def referenced_columns(m: Model) -> "OrderedDict[tuple[str, str], OrderedDict[st
     texts = [c.target_column for c in m.columns if is_expression(c.target_column)]
     texts += m.join_predicates + m.attrs["INCREMENTAL_FILTER"]
     for t in texts:
-        t = re.sub(r"\{\{.*?\}\}", "", t)  # ignore jinja such as {{ this }}
+        t = re.sub(r"\{\{\s*this\s*\}\}", "", t)  # keep refs inside macros, e.g. {{ dbt.datediff('o.a', ...) }}
         for alias, col in QUALIFIED_REF_RE.findall(t):
             if alias.lower() in by_alias:
                 refs.setdefault(by_alias[alias.lower()], OrderedDict())[col.lower()] = None
@@ -673,7 +687,7 @@ def render_models_yml(models: list[Model], opts: Options) -> str:
                 col["data_type"] = c.target_datatype.lower()
             src = f"{c.source_name}.{c.alias}.{c.source_column.lower()}"
             col["description"] = c.description or \
-                (f"Mapped from {src}" + (f" via {c.target_column.strip()}" if is_expression(c.target_column) else ""))
+                (f"Mapped from {src}" + (f" via {split_alias(c.target_column)[0]}" if is_expression(c.target_column) else ""))
             auto = []
             if name in m.unique_key:
                 auto = ["not_null"] + (["unique"] if len(m.unique_key) == 1 else [])
