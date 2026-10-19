@@ -1,13 +1,15 @@
-# dbt Model Accelerator v2.3
+# dbt Model Accelerator v2.4
 
 Turns a source-to-target mapping spreadsheet into a dbt project slice that follows dbt Labs'
-recommended structure: CTE-style models, YAML docs and tests, an optional staging layer,
-optional contracts, and CI drift checks.
+recommended structure: CTE-style models, one YAML file per model, an optional staging layer,
+optional contracts, and CI drift checks. It targets Snowflake, PostgreSQL, BigQuery, Databricks or Redshift
+(`--database`).
 
 ## Quick start
     pip install openpyxl
     python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output              # no staging layer
     python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output --staging    # with staging layer
+    python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output --database bigquery
     # strict "production" profile
     python generate_dbt_models.py STM_dbt_Mapping_Template.xlsx -o dbt_output \
         --enforce-contracts --surrogate-key --audit-columns --freshness-field _loaded_at
@@ -21,7 +23,8 @@ add `packages.yml` (if generated), then run `dbt deps && dbt build`.
       models/<staging folder>/_<folder>__models.yml     staging docs            (only if staging used)
       models/<staging folder>/stg_<source>__<table>.sql one per source table  (only if staging used)
       models/<target folder>/<model>.sql                one per MODEL_NAME
-      models/<target folder>/_<folder>__models.yml      descriptions, data_type, tests, contracts, meta
+      models/<target folder>/<model>.yml                one per model: descriptions, data_type, tests, contracts, meta
+                                                       (--yaml-layout folder -> one _<folder>__models.yml per folder)
       packages.yml                                     dbt_utils, only when needed
       dbt_project_snippet.yml                          folder-level materialization defaults
       .sqlfluff                                        lint rules matching the generated style
@@ -40,8 +43,9 @@ add `packages.yml` (if generated), then run `dbt deps && dbt build`.
 | Audit columns | `--audit-columns` adds `dbt_loaded_at` and `dbt_invocation_id` for traceability back to the dbt run. |
 | Source freshness | `--freshness-field <col>` adds warn 24h / error 48h freshness to every source. |
 | Selectors and environments | TAGS -> `config(tags=...)`, SCHEMA -> `config(schema=...)`, TARGET_TABLE -> `alias` when it differs from the model name. |
-| Incremental safety | `merge` strategy, `on_schema_change='append_new_columns'`, `is_incremental()` filter from INCREMENTAL_FILTER. |
-| Linting | `.sqlfluff` with the dbt templater, lower-case keywords and explicit aliasing (`--dialect`, default snowflake). |
+| Incremental safety | Platform-appropriate strategy (see below), `on_schema_change='append_new_columns'`, `is_incremental()` filter from INCREMENTAL_FILTER. |
+| Linting | `.sqlfluff` with the dbt templater, lower-case keywords and explicit aliasing; dialect follows `--database` (`--dialect` overrides). |
+| One YAML per model | `<model>.yml` sits next to `<model>.sql`, so a model and its docs and tests move, review and merge together. |
 | CI drift check | `--check` regenerates in memory and fails if committed models differ from the mapping, so nobody hand-edits generated SQL. |
 | Clean regeneration | `--clean` removes `OUTPUT/models` first, so models deleted from the mapping don't linger. |
 | Validation gate | Errors (missing join, bad key, duplicate column, conflicting settings, alias clash) skip the model and exit 1. `--force` writes it with a TODO marker. |
@@ -80,8 +84,46 @@ The template's README tab explains each column with an example.
 | `--audit-columns` | off | dbt_loaded_at, dbt_invocation_id |
 | `--no-composite-test` | test on | Skip unique_combination_of_columns |
 | `--legacy-test-syntax` | off | `tests:` with top-level args (dbt < 1.10) |
-| `--project-name` / `--dialect` | my_dbt_project / snowflake | For the snippet and .sqlfluff |
+| `--database` | snowflake | snowflake, postgres, bigquery, databricks, redshift |
+| `--incremental-strategy` | per database | Override the default; checked against what that platform supports |
+| `--yaml-layout` | model | `model` = one `<model>.yml` per model; `folder` = one `_<folder>__models.yml` per folder |
+| `--project-name` / `--dialect` | my_dbt_project / from `--database` | For the snippet and .sqlfluff |
 | `--force` / `--clean` / `--check` | off | Run modes (see above) |
+
+## Target databases (`--database`)
+Write TARGET_DATATYPE once in any common spelling (`int`, `varchar(100)`, `decimal(18,2)`, `number(38,0)`, `timestamp_ntz`,
+`boolean`, ...). The generator translates it for the chosen platform, both in the SQL `cast()` and in the YAML `data_type`
+used by contracts.
+
+| Mapping type | snowflake | postgres | redshift | bigquery | databricks |
+|---|---|---|---|---|---|
+| int | int | integer | integer | int64 | int |
+| number(38,0) / bigint | bigint | bigint | bigint | int64 | bigint |
+| decimal(18,2) | number(18,2) | numeric(18,2) | decimal(18,2) | numeric(18,2) cast, `numeric` in YAML | decimal(18,2) |
+| decimal(38,12) | number(38,12) | numeric(38,12) | decimal(38,12) | bignumeric | decimal(38,12) |
+| varchar(100) | varchar(100) | varchar(100) | varchar(100) (capped at 65535) | string | string |
+| text / string | varchar | text | varchar(max) | string | string |
+| char(2) | char(2) | char(2) | char(2) | string | string |
+| float | float | double precision | double precision | float64 | double |
+| boolean | boolean | boolean | boolean | bool | boolean |
+| timestamp | timestamp_ntz | timestamp | timestamp | timestamp | timestamp |
+| timestamp_ntz | timestamp_ntz | timestamp | timestamp | datetime | timestamp_ntz |
+| timestamp_tz | timestamp_tz | timestamptz | timestamptz | timestamp | timestamp |
+| variant / json | variant | jsonb | super | json | string |
+| time | time | time | time | time | string (warning) |
+
+| Platform | Incremental default | Extra config | sqlfluff dialect |
+|---|---|---|---|
+| snowflake | merge | - | snowflake |
+| bigquery | merge | - | bigquery |
+| databricks | merge | `file_format='delta'` | databricks |
+| postgres | delete+insert | - | postgres |
+| redshift | delete+insert | - | redshift |
+
+- **Other generated columns.** The surrogate key and audit columns are typed per platform too (e.g. `string` on BigQuery and Databricks, `varchar(32)` elsewhere).
+- **Types that aren't recognised** (e.g. `geography`) pass through unchanged, with a warning.
+- **Translation report.** `generation_report.md` lists every mapping type with its SQL cast and YAML type for the chosen database.
+- **Your own expressions aren't translated.** Expressions you write in TARGET_COLUMN, JOIN_CONDITION or INCREMENTAL_FILTER are used as written, so stick to portable SQL or dbt's cross-database macros (`{{ dbt.datediff(...) }}`, `{{ dbt.concat(...) }}`, `{{ dbt.safe_cast(...) }}`).
 
 ## Folders
 All paths are relative to the `models/` root. Nested paths such as `marts/finance/reporting` are allowed,
@@ -105,6 +147,11 @@ and a leading `models/` is ignored.
 
 The report has a Staging column per model, plus the staging model (if any) for each source table.
 
-Verified with dbt-core 1.12 + dbt-duckdb, including nested custom staging and target folders, in all three modes (default, `--staging`, `--no-staging`), with a
+**v2.4 validation (sales example, all strict flags):** PostgreSQL 16 real `dbt build` PASS=64 (contracts enforced,
+delete+insert incremental re-run correct). Snowflake, BigQuery, Databricks and Redshift: `dbt parse` with each real adapter,
+plus all 15 models compiled with each adapter's own macros (no warehouse connection), and the compiled SQL
+syntax-checked in that dialect: 15/15 on each. See `validation/`.
+
+Earlier: verified with dbt-core 1.12 + dbt-duckdb, including nested custom staging and target folders, in all three modes (default, `--staging`, `--no-staging`), with a
 per-model `Y` mixed in: all flags on gives PASS=20 on `dbt build` (6 models, 14 tests,
 contracts enforced), and the incremental model merges new rows on a second run.

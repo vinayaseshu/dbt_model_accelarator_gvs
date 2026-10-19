@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-dbt Model Accelerator  (v2 - best-practice edition)
-===================================================
+dbt Model Accelerator  (v2.4 - multi-database edition)
+======================================================
 Generates a dbt project slice from a Source-to-Target Mapping (STM) spreadsheet:
 
   models/<staging folder>/_<source>__sources.yml        source definitions (+ optional freshness)
   models/<staging folder>/stg_<source>__<table>.sql     OPTIONAL staging layer, one per source table
   models/<staging folder>/_<folder>__models.yml         OPTIONAL staging docs
   models/<target folder>/<model>.sql                    one per MODEL_NAME
-  models/<target folder>/_<folder>__models.yml          docs, data_type, tests, contracts
+  models/<target folder>/<model>.yml                    one per model: docs, data_type, tests, contracts
+                                                        (--yaml-layout folder -> one _<folder>__models.yml)
+
+Target database (--database, default snowflake): snowflake | postgres | bigquery | databricks | redshift
+  Translates TARGET_DATATYPE for casts and contract data_type, picks a supported incremental
+  strategy, types the surrogate-key / audit columns and sets the sqlfluff dialect.
 
 Folders (relative to the models/ root; nested paths allowed):
   STAGING_MODEL_FOLDER  per source table; blank = <--staging-dir>/<source>   (default staging/<source>)
@@ -30,6 +35,7 @@ Staging layer is OPTIONAL and off by default:
 Usage
   python generate_dbt_models.py mapping.xlsx -o dbt_output
   python generate_dbt_models.py mapping.xlsx -o dbt_output --staging
+  python generate_dbt_models.py mapping.xlsx -o dbt_output --database bigquery
   python generate_dbt_models.py mapping.xlsx -o dbt_output --enforce-contracts --surrogate-key --audit-columns
   python generate_dbt_models.py mapping.xlsx -o dbt_output --check      # CI drift check
 """
@@ -47,7 +53,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 log = logging.getLogger("dbt_accelerator")
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +127,125 @@ def normalize_folder(text: str) -> tuple[str, str | None]:
 
 
 # --------------------------------------------------------------------------- #
+# Target database platforms and type translation
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Platform:
+    name: str
+    sqlfluff_dialect: str
+    incremental_strategy: str
+    incremental_extra: tuple = ()          # extra config() entries for incremental models
+    max_varchar: int | None = None
+
+
+PLATFORMS = {
+    "snowflake": Platform("snowflake", "snowflake", "merge"),
+    "bigquery": Platform("bigquery", "bigquery", "merge"),
+    "databricks": Platform("databricks", "databricks", "merge", ("file_format='delta'",)),
+    # delete+insert works on every supported Postgres / Redshift version (merge needs PG15+ / newer adapters)
+    "postgres": Platform("postgres", "postgres", "delete+insert"),
+    "redshift": Platform("redshift", "redshift", "delete+insert", (), 65535),
+}
+VALID_STRATEGIES = {
+    "snowflake": {"merge", "append", "delete+insert", "insert_overwrite", "microbatch"},
+    "bigquery": {"merge", "insert_overwrite", "microbatch"},
+    "databricks": {"merge", "append", "insert_overwrite", "replace_where", "microbatch"},
+    "postgres": {"delete+insert", "append", "merge", "microbatch"},
+    "redshift": {"delete+insert", "append", "merge", "microbatch"},
+}
+
+_TYPE_RE = re.compile(r"^\s*([a-z_][a-z0-9_ ]*?)\s*(?:\(\s*([^)]*)\))?\s*$", re.I)
+_FAMILY = {
+    # canonical family <- accepted spellings
+    "tinyint": ["tinyint", "byteint", "int1"],
+    "smallint": ["smallint", "int2"],
+    "int": ["int", "integer", "int4", "int32"],
+    "bigint": ["bigint", "int8", "int64", "long"],
+    "decimal": ["decimal", "numeric", "number", "dec", "bignumeric"],
+    "float": ["float", "float4", "float8", "float64", "double", "double precision", "real"],
+    "varchar": ["varchar", "character varying", "nvarchar", "nvarchar2", "varchar2"],
+    "char": ["char", "character", "nchar", "bpchar"],
+    "string": ["string", "text"],
+    "boolean": ["boolean", "bool"],
+    "date": ["date"],
+    "time": ["time"],
+    "timestamp": ["timestamp", "datetime"],          # zone-less / platform default
+    "timestamp_ntz": ["timestamp_ntz", "timestamp without time zone"],
+    "timestamp_tz": ["timestamp_tz", "timestamptz", "timestamp with time zone", "timestamp_ltz"],
+    "json": ["json", "jsonb", "variant", "object", "super"],
+    "binary": ["binary", "varbinary", "bytea", "bytes", "varbyte"],
+}
+_ALIAS_TO_FAMILY = {alias: fam for fam, aliases in _FAMILY.items() for alias in aliases}
+
+
+def translate_type(raw: str, database: str, purpose: str = "cast") -> tuple[str, str | None]:
+    """Translate a mapping datatype to the target database. purpose='contract' gives the
+    data_type for YAML contracts (BigQuery drops parameters there). Returns (type, warning)."""
+    m = _TYPE_RE.match(raw or "")
+    if not m:
+        return raw.strip().lower(), f"datatype '{raw}' not recognised - used as-is"
+    name, params = re.sub(r"\s+", " ", m.group(1).lower()), (m.group(2) or "").replace(" ", "")
+    fam = _ALIAS_TO_FAMILY.get(name)
+    if fam is None:
+        return raw.strip().lower(), f"datatype '{raw}' not recognised for {database} - used as-is"
+    p = [x for x in params.split(",") if x]
+    warn = None
+
+    # NUMBER(p,0) behaves as an integer; NUMBER/NUMERIC without params keeps platform default precision
+    if fam == "decimal" and p and len(p) >= 1 and (len(p) == 1 or p[1] == "0") and name == "number":
+        fam = "bigint" if int(p[0]) > 9 else "int"
+        p = []
+    db = database
+    if db == "snowflake":
+        out = {"tinyint": "tinyint", "smallint": "smallint", "int": "int", "bigint": "bigint",
+               "decimal": f"number({','.join(p)})" if p else "number(38,0)", "float": "float",
+               "varchar": f"varchar({p[0]})" if p else "varchar", "char": f"char({p[0]})" if p else "char(1)",
+               "string": "varchar", "boolean": "boolean", "date": "date", "time": "time",
+               "timestamp": "timestamp_ntz", "timestamp_ntz": "timestamp_ntz",
+               "timestamp_tz": "timestamp_ltz" if name == "timestamp_ltz" else "timestamp_tz",
+               "json": "variant", "binary": "binary"}[fam]
+    elif db in ("postgres", "redshift"):
+        cap = PLATFORMS[db].max_varchar
+        n = int(p[0]) if p and p[0].isdigit() else None
+        if cap and n and n > cap:
+            warn, n = f"varchar({n}) exceeds {db} maximum - capped at {cap}", cap
+        vchar = f"varchar({n})" if n else ("varchar(max)" if db == "redshift" else "text")
+        out = {"tinyint": "smallint", "smallint": "smallint", "int": "integer", "bigint": "bigint",
+               "decimal": f"numeric({','.join(p)})" if p else "numeric(38,0)",
+               "float": "double precision", "varchar": vchar,
+               "char": f"char({p[0]})" if p else "char(1)",
+               "string": "varchar(max)" if db == "redshift" else "text",
+               "boolean": "boolean", "date": "date", "time": "time",
+               "timestamp": "timestamp", "timestamp_ntz": "timestamp", "timestamp_tz": "timestamptz",
+               "json": "super" if db == "redshift" else "jsonb",
+               "binary": "varbyte" if db == "redshift" else "bytea"}[fam]
+        if db == "redshift" and fam == "decimal":
+            out = out.replace("numeric", "decimal")
+    elif db == "bigquery":
+        if fam == "decimal":
+            prec, scale = (int(p[0]) if p else 38), (int(p[1]) if len(p) > 1 else 0)
+            base = "numeric" if prec - scale <= 29 and scale <= 9 else "bignumeric"
+            out = f"{base}({prec},{scale})" if p and purpose == "cast" else base
+        else:
+            out = {"tinyint": "int64", "smallint": "int64", "int": "int64", "bigint": "int64",
+                   "float": "float64", "varchar": "string", "char": "string", "string": "string",
+                   "boolean": "bool", "date": "date", "time": "time", "timestamp": "timestamp",
+                   "timestamp_ntz": "datetime", "timestamp_tz": "timestamp", "json": "json",
+                   "binary": "bytes"}[fam]
+    elif db == "databricks":
+        out = {"tinyint": "tinyint", "smallint": "smallint", "int": "int", "bigint": "bigint",
+               "decimal": f"decimal({','.join(p)})" if p else "decimal(38,0)", "float": "double",
+               "varchar": "string", "char": "string", "string": "string", "boolean": "boolean",
+               "date": "date", "time": "string", "timestamp": "timestamp", "timestamp_ntz": "timestamp_ntz",
+               "timestamp_tz": "timestamp", "json": "string", "binary": "binary"}[fam]
+        if fam == "time":
+            warn = "databricks has no TIME type - mapped to string"
+    else:  # pragma: no cover - guarded by argparse
+        raise ValueError(database)
+    return out, warn
+
+
+# --------------------------------------------------------------------------- #
 # Options
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -137,8 +262,15 @@ class Options:
     legacy_test_syntax: bool = False
     freshness_field: str | None = None
     project_name: str = "my_dbt_project"
-    dialect: str = "snowflake"
+    dialect: str | None = None            # sqlfluff dialect; None = derived from database
     mapping_file: str = "mapping"
+    database: str = "snowflake"
+    incremental_strategy: str | None = None  # None = platform default
+    yaml_layout: str = "model"            # model = <model>.yml per model; folder = _<folder>__models.yml
+
+    @property
+    def platform(self) -> "Platform":
+        return PLATFORMS[self.database]
 
     @property
     def tests_key(self) -> str:
@@ -327,10 +459,10 @@ def source_expression(c: ColumnMap, qualify: bool) -> str:
     return f"{c.alias}.{col}" if qualify else col
 
 
-def column_sql(c: ColumnMap, qualify: bool) -> str:
+def column_sql(c: ColumnMap, qualify: bool, database: str) -> str:
     expr = source_expression(c, qualify)
     if c.target_datatype.strip():
-        expr = f"cast({expr} as {c.target_datatype.strip().lower()})"
+        expr = f"cast({expr} as {translate_type(c.target_datatype, database)[0]})"
     return f"{expr} as {target_alias(c)}"
 
 
@@ -458,6 +590,12 @@ def validate(m: Model, opts: Options) -> None:
         if not m.attrs["INCREMENTAL_FILTER"]:
             m.warnings.append("Incremental model without INCREMENTAL_FILTER - a TODO filter is generated")
 
+    for c in m.columns:
+        if c.target_datatype:
+            _, tw = translate_type(c.target_datatype, opts.database)
+            if tw:
+                m.warnings.append(f"Row {c.row}: {tw}")
+
     # Feature decisions -----------------------------------------------------
     flag = m.first("USE_STAGING").lower()
     if not flag:
@@ -483,6 +621,10 @@ def validate(m: Model, opts: Options) -> None:
 # --------------------------------------------------------------------------- #
 # SQL rendering
 # --------------------------------------------------------------------------- #
+SK_TYPE = "varchar(32)"                          # md5 hex from dbt_utils.generate_surrogate_key
+AUDIT_TYPES = ("timestamp", "varchar(50)")       # dbt_loaded_at, dbt_invocation_id
+
+
 def staging_name(source: str, table: str) -> str:
     return f"stg_{source}__{table}"
 
@@ -507,13 +649,15 @@ def render_staging(source: str, table: str, columns: list[str], opts: Options, e
     )
 
 
-def render_config(m: Model) -> str:
+def render_config(m: Model, opts: Options) -> str:
     parts = [f"materialized='{m.materialization}'"]
     keys = m.effective_unique_key
     if keys and m.materialization != "ephemeral":
         parts.append(f"unique_key='{keys[0]}'" if len(keys) == 1 else f"unique_key={keys!r}")
     if m.materialization == "incremental":
-        parts += ["incremental_strategy='merge'", "on_schema_change='append_new_columns'"]
+        strategy = opts.incremental_strategy or opts.platform.incremental_strategy
+        parts += [f"incremental_strategy='{strategy}'", "on_schema_change='append_new_columns'"]
+        parts += list(opts.platform.incremental_extra)
     if m.first("SCHEMA"):
         parts.append(f"schema='{m.first('SCHEMA').lower()}'")
     if m.tags:
@@ -555,11 +699,14 @@ def render_model(m: Model, opts: Options) -> str:
         for k in m.unique_key:
             c = next(c for c in m.columns if target_alias(c) == k)
             key_exprs.append(f"'{source_expression(c, qualify)}'")
-        select.append(f"{{{{ dbt_utils.generate_surrogate_key([{', '.join(key_exprs)}]) }}}} as {m.surrogate_key}")
-    select += [column_sql(c, qualify) for c in m.columns]
+        sk_type = translate_type(SK_TYPE, opts.database)[0]
+        select.append(f"cast({{{{ dbt_utils.generate_surrogate_key([{', '.join(key_exprs)}]) }}}} as {sk_type}) "
+                      f"as {m.surrogate_key}")
+    select += [column_sql(c, qualify, opts.database) for c in m.columns]
     if opts.audit_columns:
-        select += ["cast({{ dbt.current_timestamp() }} as timestamp) as dbt_loaded_at",
-                   "cast('{{ invocation_id }}' as varchar(50)) as dbt_invocation_id"]
+        ts, vc = (translate_type(t, opts.database)[0] for t in AUDIT_TYPES)
+        select += [f"cast({{{{ dbt.current_timestamp() }}}} as {ts}) as dbt_loaded_at",
+                   f"cast('{{{{ invocation_id }}}}' as {vc}) as dbt_invocation_id"]
 
     imports = []
     for s, t in m.sources:
@@ -574,8 +721,8 @@ def render_model(m: Model, opts: Options) -> str:
         body += ["", "    {% if is_incremental() %}", f"    where {flt}", "    {% endif %}"]
 
     header = [
-        render_config(m), "",
-        f"-- Auto-generated by dbt_accelerator v{__version__} from {opts.mapping_file}.",
+        render_config(m, opts), "",
+        f"-- Auto-generated by dbt_accelerator v{__version__} from {opts.mapping_file} for {opts.database}.",
         "-- Do not edit by hand: change the mapping document and regenerate.", "",
         "with", "",
     ]
@@ -666,7 +813,8 @@ def render_models_yml(models: list[Model], opts: Options) -> str:
         entry: dict = {"name": m.name,
                        "description": m.first("MODEL_DESCRIPTION") or
                        f"Target {', '.join(m.target_tables) or m.name}; built from {', '.join(m.aliases)}."}
-        cfg: dict = {"meta": {"generated_by": f"dbt_accelerator v{__version__}", "mapping_file": opts.mapping_file}}
+        cfg: dict = {"meta": {"generated_by": f"dbt_accelerator v{__version__}", "mapping_file": opts.mapping_file,
+                              "target_database": opts.database}}
         if m.contract:
             cfg["contract"] = {"enforced": True}
         entry["config"] = cfg
@@ -677,14 +825,14 @@ def render_models_yml(models: list[Model], opts: Options) -> str:
         if m.surrogate_key:
             col = {"name": m.surrogate_key, "description": f"Surrogate key: hash of {', '.join(m.unique_key)}."}
             if m.contract:
-                col["data_type"] = "varchar"
+                col["data_type"] = translate_type(SK_TYPE, opts.database, "contract")[0]
             col[tk] = ["not_null", "unique"]
             cols.append(col)
         for c in m.columns:
             name = target_alias(c)
             col = {"name": name}
             if c.target_datatype:
-                col["data_type"] = c.target_datatype.lower()
+                col["data_type"] = translate_type(c.target_datatype, opts.database, "contract")[0]
             src = f"{c.source_name}.{c.alias}.{c.source_column.lower()}"
             col["description"] = c.description or \
                 (f"Mapped from {src}" + (f" via {split_alias(c.target_column)[0]}" if is_expression(c.target_column) else ""))
@@ -696,10 +844,11 @@ def render_models_yml(models: list[Model], opts: Options) -> str:
                 col[tk] = [test_entry(t, opts) for t in tests]
             cols.append(col)
         if opts.audit_columns:
+            ts, vc = (translate_type(t, opts.database, "contract")[0] for t in AUDIT_TYPES)
             cols.append({"name": "dbt_loaded_at", "description": "Timestamp the row was written by dbt.",
-                         **({"data_type": "timestamp"} if m.contract else {})})
+                         **({"data_type": ts} if m.contract else {})})
             cols.append({"name": "dbt_invocation_id", "description": "dbt invocation_id of the run that wrote the row.",
-                         **({"data_type": "varchar(50)"} if m.contract else {})})
+                         **({"data_type": vc} if m.contract else {})})
         entry["columns"] = cols
         docs.append(entry)
     return yaml_doc({"version": 2, "models": docs})
@@ -745,7 +894,7 @@ def render_sqlfluff(opts: Options) -> str:
     return f"""# SQL lint config matching the generated style. Requires: pip install sqlfluff sqlfluff-templater-dbt
 [sqlfluff]
 templater = dbt
-dialect = {opts.dialect}
+dialect = {opts.dialect or opts.platform.sqlfluff_dialect}
 max_line_length = 120
 exclude_rules = ST06
 
@@ -854,10 +1003,14 @@ def generate(models: "OrderedDict[str, Model]", out: Path, opts: Options, force:
         fdir.mkdir(parents=True, exist_ok=True)
         for m in ms:
             (fdir / f"{m.name}.sql").write_text(render_model(m, opts), encoding="utf-8")
-            log.info("Wrote %s/%s.sql (%s, %d cols, %s%s)", folder, m.name, m.materialization, len(m.columns),
+            if opts.yaml_layout == "model":
+                (fdir / f"{m.name}.yml").write_text(render_models_yml([m], opts), encoding="utf-8")
+            log.info("Wrote %s/%s.sql%s (%s, %d cols, %s%s)", folder, m.name,
+                     " + .yml" if opts.yaml_layout == "model" else "", m.materialization, len(m.columns),
                      "via staging" if m.use_staging else "direct from source", ", contract" if m.contract else "")
-        leaf = folder.split("/")[-1]
-        (fdir / f"_{leaf}__models.yml").write_text(render_models_yml(ms, opts), encoding="utf-8")
+        if opts.yaml_layout == "folder":
+            leaf = folder.split("/")[-1]
+            (fdir / f"_{leaf}__models.yml").write_text(render_models_yml(ms, opts), encoding="utf-8")
 
     # Project scaffolding ------------------------------------------------------
     needs_utils = any(m.surrogate_key or (len(m.unique_key) > 1 and opts.composite_test) for m in written)
@@ -875,8 +1028,11 @@ def write_report(models, written, skipped, by_source, by_stage, staging_folder, 
     feats = [("Staging default", opts.staging), ("Model contracts", opts.enforce_contracts),
              ("Surrogate keys", opts.surrogate_key), ("Audit columns", opts.audit_columns),
              ("Source freshness", bool(opts.freshness_field))]
+    strategy = opts.incremental_strategy or opts.platform.incremental_strategy
     rep = [f"# dbt accelerator v{__version__} - generation report", "",
-           f"Mapping: `{opts.mapping_file}`  ", "Features: " + ", ".join(f"{n}={'on' if v else 'off'}" for n, v in feats),
+           f"Mapping: `{opts.mapping_file}`  ",
+           f"Target database: **{opts.database}** (incremental strategy `{strategy}`, "
+           f"YAML layout `{opts.yaml_layout}`)  ", "Features: " + ", ".join(f"{n}={'on' if v else 'off'}" for n, v in feats),
            "", "## Models", "",
            "| Model | Status | Target folder | Materialization | Unique key | Staging | Contract | Upstream | Issues |",
            "|---|---|---|---|---|---|---|---|---|"]
@@ -896,6 +1052,18 @@ def write_report(models, written, skipped, by_source, by_stage, staging_folder, 
             stg = staging_name(s, t) if staged else "-"
             fold = f"models/{staging_folder(s, t)}" if staged else "-"
             rep.append(f"| {s} | {t} | {stg} | {fold} | {', '.join(cols)} |")
+    # Datatype translation table: what each mapping type became on this database
+    types = OrderedDict()
+    for m in written:
+        for c in m.columns:
+            if c.target_datatype:
+                key = c.target_datatype.strip().lower()
+                types.setdefault(key, (translate_type(key, opts.database)[0],
+                                       translate_type(key, opts.database, "contract")[0]))
+    if types:
+        rep += ["", f"## Datatype translation ({opts.database})", "",
+                "| Mapping TARGET_DATATYPE | SQL cast | YAML data_type |", "|---|---|---|"]
+        rep += [f"| {k} | {v[0]} | {v[1]} |" for k, v in types.items()]
     if global_warnings:
         rep += ["", "## Warnings", ""] + [f"- {w}" for w in global_warnings]
     (out / "generation_report.md").write_text("\n".join(rep) + "\n", encoding="utf-8")
@@ -955,7 +1123,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="Emit 'tests:' with top-level args (dbt < 1.10) instead of 'data_tests:' + 'arguments:'")
     g = ap.add_argument_group("project")
     g.add_argument("--project-name", default="my_dbt_project", help="dbt project name for dbt_project_snippet.yml")
-    g.add_argument("--dialect", default="snowflake", help="sqlfluff dialect (snowflake, bigquery, databricks, ...)")
+    g.add_argument("--database", "--target-db", dest="database", default="snowflake", choices=sorted(PLATFORMS),
+                   help="Target platform the models are generated for (default: snowflake)")
+    g.add_argument("--incremental-strategy", help="Override the platform's default incremental strategy "
+                   "(snowflake/bigquery/databricks: merge, postgres/redshift: delete+insert)")
+    g.add_argument("--yaml-layout", choices=["model", "folder"], default="model",
+                   help="model: one <model>.yml per target model (default); folder: one _<folder>__models.yml")
+    g.add_argument("--dialect", default=None, help="sqlfluff dialect override (default: from --database)")
     g = ap.add_argument_group("run mode")
     g.add_argument("--force", action="store_true", help="Also write models that fail validation (TODO markers)")
     g.add_argument("--check", action="store_true", help="CI mode: fail if OUTPUT differs from what the mapping generates")
@@ -978,7 +1152,11 @@ def main(argv: list[str] | None = None) -> int:
                    surrogate_key=a.surrogate_key, audit_columns=a.audit_columns,
                    composite_test=not a.no_composite_test, legacy_test_syntax=a.legacy_test_syntax,
                    freshness_field=a.freshness_field, project_name=a.project_name, dialect=a.dialect,
-                   mapping_file=a.mapping.name)
+                   mapping_file=a.mapping.name, database=a.database,
+                   incremental_strategy=a.incremental_strategy, yaml_layout=a.yaml_layout)
+    if opts.incremental_strategy and opts.incremental_strategy not in VALID_STRATEGIES[opts.database]:
+        ap.error(f"--incremental-strategy '{opts.incremental_strategy}' is not supported on {opts.database}; "
+                 f"choose from {sorted(VALID_STRATEGIES[opts.database])}")
     models = build_models(read_rows(a.mapping, a.sheet), opts)
 
     if a.check:
